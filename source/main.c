@@ -317,7 +317,6 @@ void threadStart() {
 	//magicKillProcess(0x27);
 	//disp(100, 0x100ff00);
 	while (1) {
-
 		if ((getKey()) == NTRMenuHotkey) {
 
 			if (allowDirectScreenAccess) {

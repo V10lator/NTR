@@ -69,7 +69,7 @@ typedef my_mem_destination_mgr *my_mem_dest_ptr;
 METHODDEF(void)
 init_destination(j_compress_ptr cinfo)
 {
-	showDbg((u8*) "init_destination", 0, 0);
+	//showDbg((u8*) "init_destination", 0, 0);
 	my_dest_ptr dest = (my_dest_ptr) cinfo->dest;
 
 	/* Allocate the output buffer --- it will be released when done with image */
@@ -184,11 +184,13 @@ term_destination(j_compress_ptr cinfo)
 	size_t datacount = OUTPUT_BUF_SIZE - dest->pub.free_in_buffer;
 
 	/* Write any data remaining in the buffer */
+	/*
 	if (datacount > 0) {
 		if (JFWRITE(dest->outfile, dest->buffer, datacount) != datacount)
 			ERREXIT(cinfo, JERR_FILE_WRITE);
 	}
 	fflush(dest->outfile);
+	*/
 	/* Make sure we wrote the output file OK
 	if (ferror(dest->outfile))
 		ERREXIT(cinfo, JERR_FILE_WRITE);

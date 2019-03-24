@@ -13,6 +13,11 @@ u8 *image_buf = NULL;
 void disp(u32 t, u32 cl);
 void print(char* s, int x, int y, char r, char g, char b);
 
+
+int sdf_setsize(int fd, u64 size) {
+	return FSFILE_SetSize(fd, size);
+}
+
 int sdf_open(char *filename, int mode)
 {
 	FS_archive sdmcArchive = { 0x9, (FS_path){ PATH_EMPTY, 1, (u8*)"" } };
@@ -827,6 +832,11 @@ u32 nightShiftUi() {
 	return 1;
 }
 
+u32 localRecordUi() {
+	rpStartLocalRecord();
+	return 1;
+}
+
 int screenshotMain() {
 	//Unused
 	//u32 retv;
@@ -848,7 +858,7 @@ int screenshotMain() {
 	}
 
 	plgRegisterMenuEntry(1, plgTranslate("Screen Filter"), nightShiftUi);
-
+	plgRegisterMenuEntry(1, plgTranslate("Enable Quick Record"), localRecordUi);
 	//Does nothing.
 	return 0;
 }

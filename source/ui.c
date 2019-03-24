@@ -151,7 +151,7 @@ s32 showMenuEx(u8* title, u32 entryCount, u8* captions[], u8* descriptions[],  u
 		}
 		for (i = drawStart; i < drawEnd; i++) {
 			strcpy((char*) buf, (i == select) ? " * " : "   ");
-			strcat((char*) buf, *((char**) captions[i]));
+			strcat((char*) buf, (char*) captions[i]);
 			print((char*) buf, x, pos, 0, 0, 0);
 			pos += 13;
 		}

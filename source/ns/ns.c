@@ -7,6 +7,7 @@
 #include <errno.h>
 #include "fastlz.h"
 #include "jpeglib.h"
+#include "mjpegwriter.h"
 
 NS_CONTEXT* g_nsCtx = 0;
 NS_CONFIG* g_nsConfig;
@@ -47,10 +48,106 @@ u32 rpCurrentMode = 0;
 u32 rpQuality = 90;
 u32 rpQosValueInBytes = 0;
 u64 rpMinIntervalBetweenPacketsInTick = 0;
-
+u32 rpIsLocalRecord = 0;
+vu64 rpLastSendTick = 0;
+vu64 rpLastFrameTick = 0;
+int rpRecordUsecPerFrame = (1000000 / (24));
 #define SYSTICK_PER_US (268);
+u64 rpRecordFps = 30;
+u64 rpMinIntervalBetweenFrames = 0;
+#define RP_MAX_RECORD_FRAMES  (120 * 24)
+#define RP_RECORD_BUF_SIZE  (32 * 1024 * 1024)
+#define RP_JPEG_MAX_SIZE (1 * 1024 * 1024)
+#define RP_MJPEG_CACHE_MAX_SIZE (0x00200000)
+u32 rpStartRecordHotkey =  + BUTTON_R + BUTTON_DU;
+
+RT_HOOK nwmValParamHook;
+
+int packetLen = 0;
+int remotePlayInited = 0;
+u8 remotePlayBuffer[2000] = { 0 };
+u8* dataBuf = remotePlayBuffer + 0x2a + 8;
+u8* imgBuffer = 0;
+int topFormat = 0, bottomFormat = 0;
+int frameSkipA = 1, frameSkipB = 1;
+u32 requireUpdateBottom = 0;
+u32 currentTopId = 0;
+u32 currentBottomId = 0;
+
+static u32 tl_fbaddr[2];
+static u32 bl_fbaddr[2];
+static u32 tl_format, bl_format;
+static u32 tl_pitch, bl_pitch;
+u32 tl_current, bl_current;
 
 
+typedef struct _RP_RECORD_CONTEXT {
+	u8 buf[RP_RECORD_BUF_SIZE];
+	int bufPos;
+	MJPEG_JPEG_FILE jpegList[RP_MAX_RECORD_FRAMES];
+	int jpegHead, jpegTail, jpegCount;
+} RP_RECORD_CONTEXT;
+RP_RECORD_CONTEXT* rpRecordCtx = 0;
+MJPEG_JPEG_FILE* rpCurrentJpegFile = 0;
+
+MJPEG_JPEG_FILE* rpGetJpegQueueTail() {
+	if (rpRecordCtx->jpegCount == 0) {
+		return 0;
+	}
+	return &(rpRecordCtx->jpegList[rpRecordCtx->jpegTail]);
+}
+
+void rpDequeueJpegQueue() {
+	rpRecordCtx->jpegCount--;
+	rpRecordCtx->jpegTail++;
+	rpRecordCtx->jpegTail %= RP_MAX_RECORD_FRAMES;
+}
+
+MJPEG_JPEG_FILE* rpEnqueueJpegQueue() {
+	MJPEG_JPEG_FILE* ret = &(rpRecordCtx->jpegList[rpRecordCtx->jpegHead]);
+	rpRecordCtx->jpegCount++;
+	rpRecordCtx->jpegHead++;
+	rpRecordCtx->jpegHead %= RP_MAX_RECORD_FRAMES;
+	return ret;
+}
+
+void rpPopOutdatedFrames() {
+	int bufStart = rpRecordCtx->bufPos;
+	int bufEnd = bufStart + RP_JPEG_MAX_SIZE;
+	while (1) {
+		MJPEG_JPEG_FILE* jpeg = rpGetJpegQueueTail();
+		if (!jpeg) {
+			break;
+		}
+		if ((jpeg->offsetInBuffer < bufEnd) && (jpeg->offsetInBuffer + jpeg->alignedSize > bufStart)) {
+			//showDbg("pop jpeg %d %d\n", jpeg->offsetInBuffer, rpRecordCtx->jpegTail);
+			rpDequeueJpegQueue();
+		}
+		else {
+			break;
+		}
+	}
+}
+
+void rpPrepareForNextFrame() {
+	rpPopOutdatedFrames();
+	if (rpRecordCtx->bufPos + RP_JPEG_MAX_SIZE > RP_RECORD_BUF_SIZE) {
+		rpRecordCtx->bufPos = 0;
+		rpPopOutdatedFrames();
+	}
+	if (rpRecordCtx->jpegCount >= RP_MAX_RECORD_FRAMES - 2) {
+		//nsDbgPrint("pop jpeg %d\n", rpRecordCtx->jpegHead);
+		rpDequeueJpegQueue();
+	}
+	rpCurrentJpegFile = rpEnqueueJpegQueue();
+	memset(rpCurrentJpegFile, 0, sizeof(MJPEG_JPEG_FILE));
+	rpCurrentJpegFile->offsetInBuffer = rpRecordCtx->bufPos;
+}
+
+void rpFinishCurrentFrame() {
+	rpCurrentJpegFile->alignedSize += (4 - (rpCurrentJpegFile->alignedSize % 4)) % 4;
+	rpRecordCtx->bufPos += rpCurrentJpegFile->alignedSize;
+}
 
 
 void*  rpMalloc(u32 size)
@@ -71,7 +168,7 @@ void*  rpMalloc(u32 size)
 	rpAllocBuffOffset += totalSize;
 	rpAllocBuffRemainSize -= totalSize;
 	memset(ret, 0, totalSize);
-	nsDbgPrint((const char*) "alloc size: %d, ptr: %08x\n", size, ret);
+	//nsDbgPrint((const char*) "alloc size: %d, ptr: %08x\n", size, ret);
 	if (rpAllocDebug) {
 		showDbg((u8*) "alloc size: %d, ptr: %08x\n", size, (u32) ret);
 	}
@@ -80,8 +177,45 @@ void*  rpMalloc(u32 size)
 
 void  rpFree(void* ptr)
 {
-	nsDbgPrint((const char*) "free: %08x\n", ptr);
+	//nsDbgPrint((const char*) "free: %08x\n", ptr);
 	return;
+}
+
+
+u32 rpMjpegCacheFilePos = 0;
+u32 rpMjpegCachePendingBytes = 0;
+
+void rpMjpegCacheReset() {
+	rpMjpegCacheFilePos = 0;
+	rpMjpegCachePendingBytes = 0;
+}
+
+void rpMjpegCacheFlush(int fd) {
+	if (rpMjpegCachePendingBytes) {
+		sdf_write(fd, rpMjpegCacheFilePos, imgBuffer, rpMjpegCachePendingBytes);
+		rpMjpegCacheFilePos += rpMjpegCachePendingBytes;
+		rpMjpegCachePendingBytes = 0;
+	}
+}
+
+void rpMjpegWriteCached(int fd, int offset, void *buf, int size) {
+	int sizeToCopy;
+	int maxSizeToCopy;
+	if (offset != rpMjpegCacheFilePos + rpMjpegCachePendingBytes) {
+		rpMjpegCacheFlush(fd);
+		rpMjpegCacheFilePos = offset;
+	}
+	if (rpMjpegCachePendingBytes + size > RP_MJPEG_CACHE_MAX_SIZE) {
+		rpMjpegCacheFlush(fd);
+	}
+	if (size < RP_MJPEG_CACHE_MAX_SIZE) {
+		memcpy(imgBuffer + rpMjpegCachePendingBytes, buf, size);
+		rpMjpegCachePendingBytes += size;
+	}
+	else {
+		rpMjpegCacheFlush(fd);
+		sdf_write(fd, offset, buf, size);
+	}
 }
 
 
@@ -183,24 +317,6 @@ u32 nwmSocPutFrameRaw(Handle handle, u8* frame, u32 size) {
 	return cmdbuf[1];
 }*/
 
-RT_HOOK nwmValParamHook;
-
-int packetLen = 0;
-int remotePlayInited = 0;
-u8 remotePlayBuffer[2000] = { 0 };
-u8* dataBuf = remotePlayBuffer + 0x2a + 8;
-u8* imgBuffer = 0;
-int topFormat = 0, bottomFormat = 0;
-int frameSkipA = 1, frameSkipB = 1;
-u32 requireUpdateBottom = 0;
-u32 currentTopId = 0;
-u32 currentBottomId = 0;
-
-static u32 tl_fbaddr[2];
-static u32 bl_fbaddr[2];
-static u32 tl_format, bl_format;
-static u32 tl_pitch, bl_pitch;
-u32 tl_current, bl_current;
 
 
 typedef u32(*sendPacketTypedef) (u8*, u32);
@@ -343,9 +459,19 @@ void remotePlayBlitInit(BLIT_CONTEXT* ctx, int width, int height, int format, in
 
 
 
-vu64 rpLastSendTick = 0;
+
+
+
+
 
 void rpSendBuffer(u8* buf, u32 size, u32 flag) {
+	if (rpIsLocalRecord) {
+		if (size > 0) {
+			memcpy(rpRecordCtx->buf + rpCurrentJpegFile->offsetInBuffer + rpCurrentJpegFile->alignedSize, buf, size);
+			rpCurrentJpegFile->alignedSize += size;
+		}
+		return;
+	}
 	if (rpAllocDebug) {
 		showDbg((u8*) "sendbuf: %08x, %d", (u32) &buf[0], size);
 		return;
@@ -667,9 +793,13 @@ void rpCaptureScreen(int isTop) {
 	u8 dmaConfig[80] = { 0, 0, 4 };
 	u32 bufSize = isTop ? (tl_pitch * 400) : (bl_pitch * 320);
 	uintptr_t phys = isTop ? tl_current : bl_current;
-	uintptr_t dest = *(uintptr_t*) imgBuffer;
+	uintptr_t dest = imgBuffer;
 	Handle hProcess = rpHandleHome;
+	if (rpIsLocalRecord) {
+		hProcess = CURRENT_PROCESS_HANDLE;
+	}
 	uintptr_t temp = 0x0;
+	static int allInVramCount = 0;
 
 
 	svc_invalidateProcessDataCache(CURRENT_PROCESS_HANDLE, dest, bufSize);
@@ -679,8 +809,23 @@ void rpCaptureScreen(int isTop) {
 	//Unused
 	//int ret;
 
+	if (isInVRAM(tl_current) && isInVRAM(bl_current) && (rpHandleGame)) {
+		allInVramCount++;
+		if (allInVramCount > 10) {
+			svc_closeHandle(rpHandleGame);
+			rpHandleGame = 0;
+		}
+	}
+	else {
+		allInVramCount = 0;
+	}
 	if (isInVRAM(phys)) {
 		temp = 0x1F000000 + (phys - 0x18000000);
+		if (rpIsLocalRecord) {
+			svc_invalidateProcessDataCache(CURRENT_PROCESS_HANDLE, temp, bufSize);
+			memcpy(dest, temp, bufSize);
+			return;
+		}
 		svc_startInterProcessDma(&rpHDma[isTop], CURRENT_PROCESS_HANDLE,
 			(void*) dest, hProcess, (void*) temp, bufSize, (u32*) dmaConfig);
 		return;
@@ -699,6 +844,65 @@ void rpCaptureScreen(int isTop) {
 	svc_sleepThread(1000000000);
 }
 
+
+int rpNextFileIndex = 0;
+
+void rpGetNextFileIndex(void)
+{
+	int fd;
+	char name[64];
+	int id;
+
+	while (1){
+		xsprintf(name, "/rec_%04d.avi", rpNextFileIndex);
+		fd = sdf_open(name, O_RDWR);
+		if (fd <= 0){
+			break;
+		}
+		sdf_close(fd);
+		rpNextFileIndex += 1;
+	}
+}
+
+void rpSaveMjpeg() {
+	disp(50, 0x1ff00ff);
+	rpGetNextFileIndex();
+	char name[64];
+	xsprintf(name, "/rec_%04d.avi", rpNextFileIndex);
+	int fd = sdf_open(name, 3 + 4);
+	sdf_setsize(fd, 0);
+	rpMjpegCacheReset();
+	MJPEG_CONTEXT ctx = { 0 };
+	MJPEG_JPEG_FILE* jpeg = 0;
+	mjpegInitWithFile(&ctx, fd);
+	int ptr = rpRecordCtx->jpegTail;
+	int i;
+	for (i = 0; i < rpRecordCtx->jpegCount; i++) {
+		jpeg = &(rpRecordCtx->jpegList[ptr]);
+		mjpegAppendJPEGFile(&ctx, rpRecordCtx->buf + jpeg->offsetInBuffer, jpeg->alignedSize, jpeg);
+		ptr++;
+		ptr %= RP_MAX_RECORD_FRAMES;
+	}
+	mjpegStartFileIndex(&ctx);
+	ptr = rpRecordCtx->jpegTail;
+	for (i = 0; i < rpRecordCtx->jpegCount; i++) {
+		jpeg = &(rpRecordCtx->jpegList[ptr]);
+		mjpegAppendFileIndex(&ctx, jpeg);
+		ptr++;
+		ptr %= RP_MAX_RECORD_FRAMES;
+	}
+	mjpegFinish(&ctx, 240, 400, 1000000 / rpRecordFps);
+	rpMjpegCacheFlush(fd);
+	sdf_close(fd);
+	disp(50, 0x100ff00);
+	rpRecordCtx->jpegHead = 0;
+	rpRecordCtx->jpegTail = 0;
+	rpRecordCtx->jpegCount = 0;
+	rpRecordCtx->bufPos = 0;
+	while ((getKey() & rpStartRecordHotkey) == rpStartRecordHotkey) {
+		svc_sleepThread(100000000);
+	}
+}
 
 
 void remotePlaySendFrames() {
@@ -728,7 +932,27 @@ void remotePlaySendFrames() {
 			}
 		}
 
+		if (rpIsLocalRecord) {
+			if ((getKey() & rpStartRecordHotkey) == rpStartRecordHotkey) {
+				rpSaveMjpeg();
+			}
+			// always record top screen in local mode
+			currentUpdating = 1;
+			vu64 tickDiff = svc_getSystemTick() - rpLastFrameTick;
+			vu64 sleepValue;
+			while (tickDiff < rpMinIntervalBetweenFrames) {
+				/*
+				sleepValue = ((rpMinIntervalBetweenFrames - tickDiff) * 1000) / SYSTICK_PER_US;
+				if (sleepValue > 1000000) {
+					svc_sleepThread(sleepValue);
+				}*/
+				tickDiff = svc_getSystemTick() - rpLastFrameTick;
+			}
+			rpLastFrameTick = svc_getSystemTick();
+		}
+
 		remotePlayKernelCallback();
+
 
 
 		if (currentUpdating) {
@@ -741,8 +965,18 @@ void remotePlaySendFrames() {
 			topContext.reset = 1;
 			topContext.id = (u8) currentTopId;
 			topContext.isTop = 1;
+			
+			
+			if (rpIsLocalRecord) {
+				rpPrepareForNextFrame();
+			}
 			remotePlayBlitCompressed(&topContext);
 			rpCompressAndSendPacket(&topContext);
+			
+			if (rpIsLocalRecord) {
+				rpFinishCurrentFrame();
+			}
+			
 		}
 		else {
 			// send bottom
@@ -764,9 +998,16 @@ void remotePlayThreadStart() {
 	//Unused
 	//u32 i, ret;
 
-	rpCurrentMode = g_nsConfig->startupInfo[8];
-	rpQuality = g_nsConfig->startupInfo[9];
-	rpQosValueInBytes = g_nsConfig->startupInfo[10];
+	if (rpIsLocalRecord) {
+		rpCurrentMode = 0x0100;
+		rpQuality = 90;
+	}
+	else {
+		rpCurrentMode = g_nsConfig->startupInfo[8];
+		rpQuality = g_nsConfig->startupInfo[9];
+		rpQosValueInBytes = g_nsConfig->startupInfo[10];
+	}
+
 	if (rpQosValueInBytes < 500 * 1024) {
 		rpQosValueInBytes = 2 * 1024 * 1024;
 	}
@@ -844,6 +1085,35 @@ void remotePlayMain() {
 	rtEnableHook(&nwmValParamHook);
 }
 
+
+void rpStartLocalRecord() {
+	if (rpIsLocalRecord) {
+		showDbg("already enabled", 0, 0);
+	}
+	rpMinIntervalBetweenFrames = ((u64)(1000000 / (rpRecordFps))) * SYSTICK_PER_US;
+	u32 ret, outAddr;
+	u32 currentKP = kGetCurrentKProcess();
+	u8 patchBuf[4] = { 0x22 };
+	// patch current process's KProcess obj to allow cpu core 2 thread (bit 13 on exheader kernel flag)
+	kmemcpy(currentKP + 0xB0 + 1, patchBuf, 1);
+	rpIsLocalRecord = 1;
+	ret = svc_controlMemory((u32*)&outAddr, 0, 0, rtAlignToPageSize(sizeof(RP_RECORD_CONTEXT)), 0x10003, 3);
+	if (ret != 0) {
+		showDbg((u8*) "alloc record buf failed: %08x", ret, 0);
+		return;
+	}
+	rpRecordCtx = outAddr;
+	memset(rpRecordCtx, 0, sizeof(RP_RECORD_CONTEXT));
+	u32* threadStack;
+	int stackSize = 0x10000;
+	threadStack = (u32*)((uintptr_t)plgRequestMemory(stackSize));
+	Handle hThread;
+	ret = svc_createThread(&hThread, &remotePlayThreadStart, 0, &threadStack[(stackSize / 4) - 10], 0x10, 2);
+	if (ret != 0) {
+		showDbg((const char*) "create thread failed: %08x\n", ret, 0);
+	}
+	setCpuClockLock(3);
+}
 
 
 int nsIsRemotePlayStarted = 0;

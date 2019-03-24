@@ -164,7 +164,7 @@ u32 getProcessTIDByHandle(u32 hProcess, u32 tid[]) {
 	uintptr_t pKCodeSet;
 	pKProcess = (uintptr_t) kGetKProcessByHandle(hProcess);
 	kmemcpy((void*) bufKProcess, (void*) pKProcess, 0x100);
-	pKCodeSet = (uintptr_t) &bufKProcess[KProcessCodesetOffset];
+	pKCodeSet = *(u32*) (&bufKProcess[KProcessCodesetOffset]);
 	kmemcpy((void*) bufKCodeSet, (void*)pKCodeSet, 0x100);
 
 	u32* pTid = (u32*)(&bufKCodeSet[0x5c]);
@@ -194,7 +194,7 @@ u32 getProcessInfo(u32 pid, u8* pname, u32 tid[], u32* kpobj) {
 
 	pKProcess = (uintptr_t) kGetKProcessByHandle(hProcess);
 	kmemcpy(bufKProcess, (void*)pKProcess, 0x100);
-	pKCodeSet = (uintptr_t) &bufKProcess[KProcessCodesetOffset];
+	pKCodeSet = *(u32*) (&bufKProcess[KProcessCodesetOffset]);
 	kmemcpy(bufKCodeSet, (void*)pKCodeSet, 0x100);
 	bufKCodeSet[0x5A] = 0;
 	u8* pProcessName = &bufKCodeSet[0x50];

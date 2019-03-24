@@ -1,2 +1,3 @@
 set PATH=%PATH%;C:\devkitPro\devkitARM\bin
-build-jpeg.py
+make
+copy ntr_payload.bin ntr.n3ds.bin
