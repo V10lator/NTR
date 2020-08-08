@@ -25,7 +25,8 @@ INCLUDES	:=	include include/jpeg
 #---------------------------------------------------------------------------------
 # options for code generation
 #---------------------------------------------------------------------------------
-ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -O3
+ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Ofast \
+			--flto=auto -fno-fat-lto-objects -fuse-linker-plugin
 
 CFLAGS	:=	-Wall \
 			-fomit-frame-pointer -ffunction-sections -fdata-sections \
